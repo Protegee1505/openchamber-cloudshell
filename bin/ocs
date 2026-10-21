@@ -207,6 +207,7 @@ passphrase_ensure() {
   if [[ -n "${OCS_PASSPHRASE:-}" && ! -s "$OCS_PASSFILE" ]]; then
     printf '%s' "$OCS_PASSPHRASE" >"$OCS_PASSFILE"
     chmod 600 "$OCS_PASSFILE"
+    OCS_PASSFILE_CREATED=1
   fi
   if [[ -s "$OCS_PASSFILE" ]]; then
     return 0
@@ -229,6 +230,7 @@ passphrase_ensure() {
   fi
   printf '%s' "$pass" >"$OCS_PASSFILE"
   chmod 600 "$OCS_PASSFILE"
+  OCS_PASSFILE_CREATED=1
 }
 
 gpg_encrypt() {
@@ -242,8 +244,17 @@ gpg_encrypt() {
 gpg_decrypt() {
   local in="$1" out="$2"
   rm -f "$out"
-  gpg --batch --yes --pinentry-mode loopback --passphrase-file "$OCS_PASSFILE" \
-    --decrypt --output "$out" "$in" 2>/dev/null || die "Could not decrypt $in (wrong passphrase?)"
+  if ! gpg --batch --yes --pinentry-mode loopback --passphrase-file "$OCS_PASSFILE" \
+    --decrypt --output "$out" "$in" 2>/dev/null; then
+    # If the user just typed a new passphrase and it did not decrypt the
+    # first archive, do not leave the typo cached.
+    if [[ "${OCS_PASSFILE_CREATED:-0}" == "1" && "${OCS_DECRYPT_SUCCESS:-0}" != "1" ]]; then
+      rm -f "$OCS_PASSFILE"
+      OCS_PASSFILE_CREATED=0
+    fi
+    die "Could not decrypt $in (wrong passphrase?)"
+  fi
+  OCS_DECRYPT_SUCCESS=1
 }
 
 copy_path() {
@@ -570,9 +581,10 @@ cmd_restore() {
   # Back up after the server is stopped so the SQLite copy is consistent.
   info "Backing up current local state..."
   mkdir -p "$OCS_STATE_DIR/backups"
-  tar -C "$HOME" -czf "$OCS_STATE_DIR/backups/pre-restore-${ts}.tar.gz" \
+  local backup_name="pre-restore-$(date -u +%Y%m%d-%H%M%S)-${ts}.tar.gz"
+  tar -C "$HOME" -czf "$OCS_STATE_DIR/backups/$backup_name" \
     .config/openchamber .config/opencode .local/share/opencode 2>/dev/null || true
-  chmod 600 "$OCS_STATE_DIR/backups/pre-restore-${ts}.tar.gz" 2>/dev/null || true
+  chmod 600 "$OCS_STATE_DIR/backups/$backup_name" 2>/dev/null || true
 
   rm -rf "$HOME/.config/openchamber" "$HOME/.config/opencode" "$HOME/.local/share/opencode"
   cp -a "$work/base/home/." "$HOME/"
