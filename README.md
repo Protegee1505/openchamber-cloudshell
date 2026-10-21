@@ -105,7 +105,8 @@ a personal shell gets the personal one. The shared OpenChamber/OpenCode state
 is common; only account-specific auth and relay files differ.
 
 On a fresh Google account, open an interactive shell once (`ocs local shell`)
-and bootstrap it:
+and bootstrap it. The snapshot repo is private, so sign in to GitHub first if
+needed (`gh auth login`), then:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Protegee1505/openchamber-cloudshell/main/install.sh | bash
