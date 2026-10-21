@@ -36,9 +36,11 @@ manager.** Losing it makes every snapshot unrecoverable.
 
 ## After a Cloud Shell restart
 
-From a local terminal with `gcloud` installed:
+From a local Linux/macOS terminal with `gcloud` installed, install only the
+controller CLI (no OpenChamber needed locally):
 
 ```bash
+OCS_INSTALL_DEPS=0 bash -c "$(curl -fsSL https://raw.githubusercontent.com/Protegee1505/openchamber-cloudshell/main/install.sh)"
 ocs local open --account my-google-config
 ```
 
@@ -65,8 +67,8 @@ ocs connect
 ```
 
 It prints a one-time `openchamber://connect?...` URL. Copy that URL, open
-OpenChamber on the phone, choose **Instances → Add → Paste link**, and paste it.
-Add `--qr` only when a second screen is available. `--open` tries
+OpenChamber on the phone, choose **Settings → Remote Instances → Import link**,
+and paste it. Add `--qr` only when a second screen is available. `--open` tries
 `termux-open-url`/`xdg-open` when the terminal supports it.
 
 Each URL is single-use and expires; generate a new one with `ocs connect`.
@@ -93,6 +95,7 @@ Use one gcloud configuration per Google account:
 ```bash
 gcloud config configurations create work
 gcloud auth login
+gcloud config configurations activate work
 ocs local accounts
 ```
 
@@ -101,15 +104,27 @@ the same hash, so a work shell gets the work GitHub auth and relay identity, and
 a personal shell gets the personal one. The shared OpenChamber/OpenCode state
 is common; only account-specific auth and relay files differ.
 
-On a fresh Google account, do `ocs restore` once (or `ocs setup`), then
-`ocs connect` to pair the phone. After that, `ocs local open` is enough.
+On a fresh Google account, open an interactive shell once (`ocs local shell`)
+and bootstrap it:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Protegee1505/openchamber-cloudshell/main/install.sh | bash
+ocs restore
+```
+
+The passphrase is not stored in the snapshot: enter the same one you saved when
+prompted, or set it with `OCS_PASSPHRASE=... ocs restore`. Then `ocs connect` to
+pair the phone. After that, `ocs local open` is enough; the passphrase is cached
+in that account's home.
 
 ## Safety and limits
 
 - Snapshots are encrypted with GPG symmetric AES-256 before upload.
 - The last 5 snapshots are kept; older release assets are pruned.
 - A pre-restore local archive is written to
-  `~/.local/share/ocs/backups/` before state is replaced.
+  `~/.local/share/ocs/backups/` before state is replaced. It is local,
+  unencrypted, and never uploaded; delete it when you no longer need it.
+- Temporary build/decrypt trees are removed on success and failure.
 - Cloud Shell is not an always-on server. The free VM stops after idle time and
   has a 12-hour maximum; use `ocs local open` to bring it back.
 - Do not put the passphrase in the repository, shell history, or a public

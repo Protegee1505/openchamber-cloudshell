@@ -95,8 +95,8 @@ def db_migrate(path: str, old_home: str, new_home: str, check: bool = True) -> N
                 try:
                     conn.execute(
                         f'UPDATE "{table}" SET "{column}" = replace("{column}", ?, ?) '
-                        f'WHERE "{column}" LIKE ?',
-                        (old_home.rstrip("/"), new_home.rstrip("/"), f"%{old_home.rstrip('/')}%"),
+                        f'WHERE instr("{column}", ?) > 0',
+                        (old_home.rstrip("/"), new_home.rstrip("/"), old_home.rstrip("/")),
                     )
                 except sqlite3.DatabaseError:
                     # A view/FTS shadow table can be read-only or have unusual

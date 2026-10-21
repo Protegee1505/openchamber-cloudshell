@@ -72,6 +72,23 @@ ensure_dirs() {
   mkdir -p "$OCS_CONFIG_DIR" "$OCS_STATE_DIR" "$HOME/.local/bin" "$HOME/.local/share/ocs"
 }
 
+lock_acquire() {
+  local timeout="${1:-0}"
+  ensure_dirs
+  command -v flock >/dev/null 2>&1 || return 0
+  exec 9>"$OCS_LOCK"
+  if [[ "$timeout" == "0" ]]; then
+    flock -n 9
+  else
+    flock -w "$timeout" 9
+  fi
+}
+
+lock_release() {
+  flock -u 9 2>/dev/null || true
+  exec 9>&- 2>/dev/null || true
+}
+
 load_config() {
   ensure_dirs
   if [[ -f "$OCS_CONFIG_FILE" ]]; then
@@ -185,6 +202,7 @@ download_asset() {
 }
 
 passphrase_ensure() {
+  local mode="${1:-create}"
   ensure_dirs
   if [[ -n "${OCS_PASSPHRASE:-}" && ! -s "$OCS_PASSFILE" ]]; then
     printf '%s' "$OCS_PASSPHRASE" >"$OCS_PASSFILE"
@@ -194,15 +212,21 @@ passphrase_ensure() {
     return 0
   fi
   if [[ ! -t 0 || "${OCS_AUTO:-0}" == "1" ]]; then
-    die "Backup passphrase is not cached. Run: ocs passphrase set"
+    die "Backup passphrase is not cached. Run 'ocs passphrase set' interactively, or set OCS_PASSPHRASE."
   fi
   local pass confirm
-  say "Choose a backup passphrase. Store it in your password manager."
-  say "If you lose it, the encrypted snapshots cannot be recovered."
-  read -rsp "Passphrase: " pass; echo
-  read -rsp "Confirm:    " confirm; echo
-  [[ -n "$pass" ]] || die "Passphrase cannot be empty."
-  [[ "$pass" == "$confirm" ]] || die "Passphrases do not match."
+  if [[ "$mode" == "restore" ]]; then
+    say "Enter the passphrase that was used to encrypt the snapshot."
+    read -rsp "Backup passphrase: " pass; echo
+    [[ -n "$pass" ]] || die "Passphrase cannot be empty."
+  else
+    say "Choose a backup passphrase. Store it in your password manager."
+    say "If you lose it, the encrypted snapshots cannot be recovered."
+    read -rsp "Passphrase: " pass; echo
+    read -rsp "Confirm:    " confirm; echo
+    [[ -n "$pass" ]] || die "Passphrase cannot be empty."
+    [[ "$pass" == "$confirm" ]] || die "Passphrases do not match."
+  fi
   printf '%s' "$pass" >"$OCS_PASSFILE"
   chmod 600 "$OCS_PASSFILE"
 }
@@ -224,7 +248,10 @@ gpg_decrypt() {
 
 copy_path() {
   local rel="$1" dest="$2"
-  if [[ -e "$HOME/$rel" ]]; then
+  if [[ -d "$HOME/$rel" ]]; then
+    mkdir -p "$dest/$rel"
+    cp -a "$HOME/$rel/." "$dest/$rel/"
+  elif [[ -e "$HOME/$rel" ]]; then
     mkdir -p "$dest/$(dirname "$rel")"
     cp -a "$HOME/$rel" "$dest/$rel"
   fi
@@ -266,7 +293,10 @@ build_base() {
       "$home/.config/openchamber/bin"
     rm -f "$home/.config/openchamber/relay-host.lock" \
       "$home/.config/openchamber/client-pairing-sessions.json" \
-      "$home/.config/openchamber/git-credential-endpoint.json"
+      "$home/.config/openchamber/git-credential-endpoint.json" \
+      "$home/.config/openchamber/relay-identity.json" \
+      "$home/.config/openchamber/remote-clients.json" \
+      "$home/.config/openchamber/apns-tokens.json"
   fi
 
   copy_path ".config/opencode" "$home"
@@ -346,12 +376,10 @@ prune_snapshots() {
     [[ -n "$ts" ]] || continue
     warn "Pruning snapshot $ts"
     local name
-    for name in \
-      "base-${ts}.tar.gz.gpg" \
-      "account-$(account_hash)-${ts}.tar.gz.gpg" \
-      "manifest-${ts}.json"; do
+    while IFS= read -r name; do
+      [[ -n "$name" ]] || continue
       gh release delete-asset "$OCS_RELEASE_TAG" "$name" --repo "$OCS_REPO" --yes >/dev/null 2>&1 || true
-    done
+    done < <(release_assets | grep -E "^(base-${ts}\\.tar\\.gz\\.gpg|account-.*-${ts}\\.tar\\.gz\\.gpg|manifest-${ts}\\.json)$" || true)
     remove_count=$((remove_count - 1))
     [[ "$remove_count" -le 0 ]] && break
   done <<<"$timestamps"
@@ -367,6 +395,12 @@ cmd_save() {
     esac
   done
   load_config
+  local own_lock=0
+  if [[ "${OCS_LOCK_HELD:-0}" != "1" ]]; then
+    lock_acquire 300 || die "Another ocs operation is running. Try again."
+    OCS_LOCK_HELD=1
+    own_lock=1
+  fi
   require_helper
   ensure_sync_repo
   ensure_release
@@ -378,6 +412,10 @@ cmd_save() {
   local out="$OCS_STATE_DIR/out-$TS"
   rm -rf "$build" "$out"
   mkdir -p "$build/base" "$build/account" "$out"
+  # The build and output trees contain plaintext state before encryption.
+  # Remove them on every path, including encryption/upload failures.
+  OCS_SAVE_CLEANUP=("$build" "$out")
+  trap 'rm -rf "${OCS_SAVE_CLEANUP[@]}"' EXIT
 
   info "Collecting OpenChamber/OpenCode state..."
   build_base "$build/base"
@@ -407,6 +445,12 @@ cmd_save() {
   local size
   size="$(du -h "$base_gpg" | cut -f1)"
   rm -rf "$build" "$out" "$base_tar" "$acct_tar"
+  trap - EXIT
+  unset OCS_SAVE_CLEANUP
+  if [[ "$own_lock" == "1" ]]; then
+    lock_release
+    OCS_LOCK_HELD=0
+  fi
   if [[ "$quiet" == "1" ]]; then
     ok "Saved snapshot $TS ($size)"
   else
@@ -430,10 +474,16 @@ cmd_restore() {
     esac
   done
   load_config
+  local own_lock=0
+  if [[ "${OCS_LOCK_HELD:-0}" != "1" ]]; then
+    lock_acquire 300 || die "Another ocs operation is running. Try again."
+    OCS_LOCK_HELD=1
+    own_lock=1
+  fi
   require_helper
   ensure_sync_repo
   ensure_release
-  passphrase_ensure
+  passphrase_ensure restore
 
   local base_name
   if [[ -n "$snapshot" ]]; then
@@ -453,6 +503,10 @@ cmd_restore() {
   grep -qx "$base_name" <<<"$assets" || die "Snapshot not found: $base_name"
   local has_account=0
   grep -qx "$acct_name" <<<"$assets" && has_account=1
+  if [[ "$has_account" != "1" ]]; then
+    warn "No account archive for $(cloudshell_account) ($(account_hash));"
+    warn "GitHub auth and the paired relay identity will not be restored."
+  fi
 
   if [[ "$yes" != "1" && -f "$HOME/.config/openchamber/settings.json" ]]; then
     warn "This will replace local OpenChamber/OpenCode state with snapshot $ts."
@@ -464,6 +518,10 @@ cmd_restore() {
   local work="$OCS_STATE_DIR/restore-$ts"
   rm -rf "$dl" "$work"
   mkdir -p "$dl" "$work/base" "$work/account"
+  # The restore tree contains decrypted state. Always remove it, including on
+  # failures after this point, so plaintext does not linger in the state dir.
+  OCS_RESTORE_CLEANUP=("$dl" "$work")
+  trap 'rm -rf "${OCS_RESTORE_CLEANUP[@]}"' EXIT
   info "Downloading snapshot $ts..."
   download_asset "$base_name" "$dl"
   download_asset "$manifest_name" "$dl"
@@ -503,9 +561,11 @@ cmd_restore() {
     .config/openchamber .config/opencode .local/share/opencode 2>/dev/null || true
   chmod 600 "$OCS_STATE_DIR/backups/pre-restore-${ts}.tar.gz" 2>/dev/null || true
 
-  info "Stopping OpenChamber..."
+  info "Stopping OpenChamber on port $OCS_PORT..."
   if command -v openchamber >/dev/null 2>&1; then
-    openchamber stop -p "$OCS_PORT" >/dev/null 2>&1 || openchamber stop >/dev/null 2>&1 || true
+    # Only stop the selected port. Falling back to a global stop here would
+    # kill an unrelated instance when a test/alternate HOME uses another port.
+    openchamber stop -p "$OCS_PORT" >/dev/null 2>&1 || true
   fi
   local i
   for i in $(seq 1 20); do
@@ -525,6 +585,12 @@ cmd_restore() {
     "$HOME/.config/openchamber/apns-tokens.json" \
     "$HOME/.config/gh/hosts.yml" 2>/dev/null || true
 
+  # The snapshot's config may carry a different port. Reload it before start.
+  load_config
+  # Keep the boot/shell hooks owned by the local install; older snapshots may
+  # contain an older hook, and a restored hook must still find node/yarn.
+  install_shell_hook
+
   if [[ -f "$HOME/.config/ocs/projects.json" ]]; then
     local path remote branch
     while IFS=$'\t' read -r path remote branch; do
@@ -541,12 +607,22 @@ cmd_restore() {
     done < <(python3 "$OCS_HELPER" projects-list "$HOME/.config/ocs/projects.json")
   fi
 
-  rm -rf "$dl"
+  rm -rf "$dl" "$work"
+  trap - EXIT
+  unset OCS_RESTORE_CLEANUP
   if [[ "$no_start" == "1" ]]; then
+    if [[ "$own_lock" == "1" ]]; then
+      lock_release
+      OCS_LOCK_HELD=0
+    fi
     ok "Restored snapshot $ts (not started)"
     return 0
   fi
   start_openchamber
+  if [[ "$own_lock" == "1" ]]; then
+    lock_release
+    OCS_LOCK_HELD=0
+  fi
   ok "Restored snapshot $ts and started OpenChamber on port $OCS_PORT"
   paired_summary
 }
@@ -558,7 +634,9 @@ start_openchamber() {
   fi
   command -v openchamber >/dev/null 2>&1 || die "OpenChamber is not installed. Run: ocs install --deps"
   info "Starting OpenChamber on port $OCS_PORT ..."
-  openchamber --port "$OCS_PORT" >>"$OCS_CONFIG_DIR/openchamber.out" 2>&1 || true
+  # Close the ocs lock fd for the daemon; otherwise a forked OpenChamber would
+  # inherit the flock and keep the lock forever.
+  openchamber --port "$OCS_PORT" >>"$OCS_CONFIG_DIR/openchamber.out" 2>&1 9>&- || true
   local i
   for i in $(seq 1 60); do
     if health_ok; then
@@ -604,9 +682,13 @@ cmd_up() {
   done
   load_config
   [[ "$auto" == "1" ]] && export OCS_AUTO=1
+  lock_acquire 300 || die "Another ocs operation is running. Try again."
+  OCS_LOCK_HELD=1
   if health_ok; then
     ok "OpenChamber is already running on port $OCS_PORT"
     paired_summary
+    lock_release
+    OCS_LOCK_HELD=0
     return 0
   fi
   if [[ ! -f "$HOME/.config/openchamber/settings.json" ]]; then
@@ -615,19 +697,30 @@ cmd_up() {
   fi
   start_openchamber
   paired_summary
+  lock_release
+  OCS_LOCK_HELD=0
 }
 
 cmd_autostart() {
   load_config
   health_ok && return 0
-  mkdir -p "$OCS_STATE_DIR"
-  exec 9>"$OCS_LOCK"
-  flock -n 9 || return 0
+  lock_acquire 0 || return 0
+  OCS_LOCK_HELD=1
   export OCS_AUTO=1
   if [[ ! -f "$HOME/.config/openchamber/settings.json" ]]; then
-    cmd_restore --no-start --yes >>"$OCS_CONFIG_DIR/autostart.log" 2>&1 || return 0
+    if ! cmd_restore --no-start --yes >>"$OCS_CONFIG_DIR/autostart.log" 2>&1; then
+      lock_release
+      OCS_LOCK_HELD=0
+      return 0
+    fi
   fi
-  start_openchamber >>"$OCS_CONFIG_DIR/autostart.log" 2>&1 || return 0
+  if ! start_openchamber >>"$OCS_CONFIG_DIR/autostart.log" 2>&1; then
+    lock_release
+    OCS_LOCK_HELD=0
+    return 0
+  fi
+  lock_release
+  OCS_LOCK_HELD=0
 }
 
 cmd_connect() {
@@ -642,15 +735,22 @@ cmd_connect() {
         cat <<'EOF'
 Usage: ocs connect [--qr] [--open] [--json] [--name LABEL]
 
-Prints a one-time openchamber:// pairing URL. Copy it into
-OpenChamber -> Instances -> Add -> Paste link. Use --qr for a QR too.
+Prints a one-time openchamber:// pairing URL. On the phone, open
+OpenChamber -> Settings -> Remote Instances -> Import link, then paste it.
+Use --qr only when a second screen is available.
 EOF
         return 0 ;;
       *) die "Unknown option: $1" ;;
     esac
   done
   load_config
-  health_ok || start_openchamber
+  lock_acquire 300 || die "Another ocs operation is running. Try again."
+  OCS_LOCK_HELD=1
+  if ! health_ok; then
+    start_openchamber
+  fi
+  lock_release
+  OCS_LOCK_HELD=0
   local label="${name:-$(hostname 2>/dev/null || echo Cloud Shell)}"
   local out
   out="$(openchamber connect-url --port "$OCS_PORT" --relay --name "$label" --json 2>/dev/null)" \
@@ -663,7 +763,7 @@ EOF
   url="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["connectUrl"])' <<<"$out")"
   expires="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("expiresAt",""))' <<<"$out")"
   say ""
-  say "${C_BOLD}Pairing URL${C_RESET} (copy this into OpenChamber -> Instances -> Add -> Paste link):"
+  say "${C_BOLD}Pairing URL${C_RESET} (OpenChamber -> Settings -> Remote Instances -> Import link, then paste):"
   say "$url"
   [[ -n "$expires" ]] && say "Expires: $expires"
   say ""
@@ -748,7 +848,7 @@ PY
 
 cmd_logs() {
   load_config
-  if [[ -f "$OCS_CONFIG_DIR/openchamber.out" ]]; then
+  if [[ -s "$OCS_CONFIG_DIR/openchamber.out" ]]; then
     tail -n "${1:-80}" "$OCS_CONFIG_DIR/openchamber.out"
   elif command -v openchamber >/dev/null 2>&1; then
     openchamber logs -p "$OCS_PORT"
@@ -806,7 +906,7 @@ cmd_doctor() {
   check "tar" command -v tar
   check "gpg" command -v gpg
   check "gh" command -v gh
-  check "node >= 24.14" bash -c 'v=$(node -v 2>/dev/null); [[ "$v" =~ ^v24\.([0-9]+) ]] && (( BASH_REMATCH[1] >= 14 ))'
+  check "node >= 24.14" bash -c 'v=$(node -v 2>/dev/null); [[ "$v" =~ ^v([0-9]+)\.([0-9]+) ]] && { [ "${BASH_REMATCH[1]}" -gt 24 ] || { [ "${BASH_REMATCH[1]}" -eq 24 ] && [ "${BASH_REMATCH[2]}" -ge 14 ]; }; }'
   check "opencode" command -v opencode
   check "openchamber" command -v openchamber
   check "GitHub auth" gh auth status
@@ -841,9 +941,12 @@ cmd_passphrase() {
       cat "$OCS_PASSFILE"; echo ;;
     path) printf '%s\n' "$OCS_PASSFILE" ;;
     set)
-      passphrase_ensure
-      warn "Existing snapshots are still encrypted with the old passphrase."
-      ;;
+      if [[ -s "$OCS_PASSFILE" ]]; then
+        warn "A passphrase is already cached; refusing to overwrite it."
+        warn "Old snapshots would become unreadable. Remove the file manually only if starting over."
+        return 1
+      fi
+      passphrase_ensure create ;;
     *) die "Usage: ocs passphrase [show|path|set]" ;;
   esac
 }
@@ -852,18 +955,29 @@ install_shell_hook() {
   ensure_dirs
   mkdir -p "$HOME/.config/ocs"
   mkdir -p "$OCS_STATE_DIR/backups"
-  if [[ -f "$HOME/.customize_environment" ]] && ! grep -q '>>> ocs >>>' "$HOME/.customize_environment"; then
-    cp -a "$HOME/.customize_environment" "$OCS_STATE_DIR/backups/customize_environment.$(date +%s)"
-  fi
   if [[ -f "$HOME/.bashrc" ]]; then
     cp -a "$HOME/.bashrc" "$OCS_STATE_DIR/backups/bashrc.$(date +%s)"
   fi
   cat >"$HOME/.config/ocs/shell.sh" <<'EOF'
 # ocs shell hook: keep PATH sane and start OpenChamber once per shell.
-case ":$PATH:" in
-  *":$HOME/.local/bin:"*) ;;
-  *) export PATH="$HOME/.local/bin:$HOME/.yarn/bin:$HOME/.opencode/bin:$PATH" ;;
-esac
+for _ocs_p in "$HOME/.local/bin" "$HOME/.yarn/bin" "$HOME/.opencode/bin"; do
+  case ":$PATH:" in
+    *":$_ocs_p:"*) ;;
+    *) PATH="$_ocs_p:$PATH" ;;
+  esac
+done
+# nvm installs Node below ~/.nvm; add any installed node bin directory.
+if [ -d "$HOME/.nvm/versions/node" ]; then
+  for _ocs_p in "$HOME"/.nvm/versions/node/*/bin; do
+    [ -d "$_ocs_p" ] || continue
+    case ":$PATH:" in
+      *":$_ocs_p:"*) ;;
+      *) PATH="$_ocs_p:$PATH" ;;
+    esac
+  done
+fi
+export PATH
+unset _ocs_p
 if [ -x "$HOME/.local/bin/ocs" ] && [ -z "${OCS_SHELL_STARTED:-}" ]; then
   export OCS_SHELL_STARTED=1
   ( "$HOME/.local/bin/ocs" autostart >/dev/null 2>&1 & ) || true
@@ -871,7 +985,13 @@ fi
 EOF
   chmod 644 "$HOME/.config/ocs/shell.sh"
 
-  cat >"$HOME/.customize_environment" <<'EOF'
+  local node_bin=""
+  if command -v node >/dev/null 2>&1; then
+    node_bin="$(dirname "$(command -v node)"):"
+  fi
+  local customize_block="$OCS_STATE_DIR/customize.block"
+  local customize_text
+  customize_text="$(cat <<'EOF'
 #!/bin/sh
 # >>> ocs >>>
 # Runs once per Cloud Shell VM boot as root. Starts OpenChamber as the
@@ -884,6 +1004,9 @@ EOF
   [ -d "$home" ] || exit 0
   mkdir -p "$home/.config/ocs"
   chown "$user:$user" "$home/.config/ocs" 2>/dev/null || true
+  log="$home/.config/ocs/autostart.log"
+  : >>"$log" 2>/dev/null || true
+  chown "$user:$user" "$log" 2>/dev/null || true
   i=0
   while [ "$i" -lt 30 ]; do
     [ -x "$home/.local/bin/ocs" ] && break
@@ -892,11 +1015,38 @@ EOF
   done
   [ -x "$home/.local/bin/ocs" ] || exit 0
   runuser -u "$user" -- env HOME="$home" USER="$user" \
-    PATH="$home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+    PATH="$home/.local/bin:$home/.yarn/bin:$home/.opencode/bin:__OCS_NODE_BIN__/usr/local/bin:/usr/bin:/bin" \
     nohup "$home/.local/bin/ocs" autostart >>"$home/.config/ocs/autostart.log" 2>&1 &
 ) >/dev/null 2>&1 &
 # <<< ocs <<<
 EOF
+)"
+  customize_text="${customize_text//__OCS_NODE_BIN__/$node_bin}"
+  printf '%s\n' "$customize_text" >"$customize_block"
+  if [[ -f "$HOME/.customize_environment" ]]; then
+    cp -a "$HOME/.customize_environment" \
+      "$OCS_STATE_DIR/backups/customize_environment.$(date +%s)" 2>/dev/null || true
+  fi
+  # Replace only the managed block, keeping any other boot commands the user
+  # may have in .customize_environment. Create the file when it is missing.
+  python3 - "$HOME/.customize_environment" "$customize_block" <<'PY'
+import os, re, sys
+
+path, block_path = sys.argv[1], sys.argv[2]
+block = open(block_path, encoding="utf-8").read().rstrip("\n") + "\n"
+block = re.sub(r"\A#!/bin/sh\n", "", block)
+old = open(path, encoding="utf-8").read() if os.path.exists(path) else ""
+pattern = re.compile(r"(?ms)^# >>> ocs >>>.*?^# <<< ocs <<<\n?")
+if pattern.search(old):
+    new = pattern.sub(lambda _m: block, old, count=1)
+elif old.strip():
+    new = old.rstrip("\n") + "\n\n" + block
+else:
+    new = "#!/bin/sh\n" + block
+with open(path, "w", encoding="utf-8") as handle:
+    handle.write(new.rstrip("\n") + "\n")
+PY
+  rm -f "$customize_block"
   chmod 755 "$HOME/.customize_environment"
   python3 "$OCS_HELPER" bashrc-install "$HOME/.bashrc"
 }
@@ -937,6 +1087,9 @@ install_deps() {
   fi
   if ! command -v openchamber >/dev/null 2>&1; then
     info "Installing OpenChamber $OCS_OPENCHAMBER_VERSION..."
+    if command -v npm >/dev/null 2>&1; then
+      npm config set allow-scripts=node-pty --location=user >/dev/null 2>&1 || true
+    fi
     if command -v yarn >/dev/null 2>&1; then
       yarn global add "@openchamber/web@$OCS_OPENCHAMBER_VERSION"
     else
@@ -977,9 +1130,17 @@ cmd_install() {
   install -m 644 "$src/lib/ocs_helper.py" "$HOME/.local/share/ocs/lib/ocs_helper.py"
   OCS_HELPER="$HOME/.local/share/ocs/lib/ocs_helper.py"
   write_default_config
-  install_shell_hook
   if [[ "$deps" == "1" ]]; then
     install_deps
+  fi
+  # Install hooks after dependencies so the boot hook can embed the real
+  # node binary path (system node or a fresh nvm install). A laptop that only
+  # uses `ocs local ...` must not get a Cloud Shell autostart hook; set
+  # OCS_INSTALL_HOOKS=1 to force it on a non-Cloud-Shell host.
+  if is_cloudshell || [[ "${OCS_INSTALL_HOOKS:-0}" == "1" ]]; then
+    install_shell_hook
+  else
+    dim "Not in Cloud Shell; skipping boot/shell hooks (set OCS_INSTALL_HOOKS=1 to force)."
   fi
   ok "Installed ocs $OCS_VERSION"
   say "  binary: $HOME/.local/bin/ocs"
@@ -992,21 +1153,29 @@ cmd_setup() {
   cmd_install --deps
   ensure_sync_repo
   ensure_release
-  passphrase_ensure
   if [[ -f "$HOME/.config/openchamber/settings.json" ]]; then
+    passphrase_ensure create
     cmd_save
   fi
+  # On a fresh machine cmd_up restores first and asks for the existing
+  # passphrase; it must not ask the user to invent a new one.
   cmd_up
 }
 
 cmd_init() {
   load_config
   require_helper
+  [[ -f "$HOME/.config/openchamber/settings.json" ]] \
+    || die "No OpenChamber data found here. On a fresh machine use: ocs restore"
   ensure_sync_repo
   ensure_release
   if [[ ! -s "$OCS_PASSFILE" ]]; then
     local pass
-    pass="$(openssl rand -base64 32 | tr -d '\n')"
+    if command -v openssl >/dev/null 2>&1; then
+      pass="$(openssl rand -base64 32 | tr -d '\n')"
+    else
+      pass="$(head -c 32 /dev/urandom | base64 | tr -d '\n')"
+    fi
     printf '%s' "$pass" >"$OCS_PASSFILE"
     chmod 600 "$OCS_PASSFILE"
     warn "Generated a random backup passphrase. Save it now: ocs passphrase show"
@@ -1041,12 +1210,21 @@ cmd_restart() {
 
 cmd_reload() {
   load_config
+  lock_acquire 300 || die "Another ocs operation is running. Try again."
+  OCS_LOCK_HELD=1
   command -v openchamber >/dev/null 2>&1 || die "OpenChamber is not installed."
   info "Restarting OpenChamber on port $OCS_PORT..."
-  openchamber restart -p "$OCS_PORT" >/dev/null 2>&1 || openchamber --port "$OCS_PORT"
+  openchamber restart -p "$OCS_PORT" 9>&- >/dev/null 2>&1 \
+    || openchamber --port "$OCS_PORT" 9>&-
   local i
   for i in $(seq 1 45); do
-    health_ok && { ok "OpenChamber is back."; paired_summary; return 0; }
+    if health_ok; then
+      lock_release
+      OCS_LOCK_HELD=0
+      ok "OpenChamber is back."
+      paired_summary
+      return 0
+    fi
     sleep 1
   done
   die "OpenChamber did not come back. See: ocs logs"
@@ -1054,7 +1232,6 @@ cmd_reload() {
 
 cmd_local() {
   local action="${1:-help}"; shift || true
-  command -v gcloud >/dev/null 2>&1 || die "gcloud is not installed on this machine."
   local account=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1065,6 +1242,21 @@ cmd_local() {
     esac
   done
   STAY="${STAY:-0}"
+  case "$action" in
+    help|--help|-h)
+      cat <<'EOF'
+Usage: ocs local <command> [--account GCLOUD_CONFIG] [--stay]
+
+Commands:
+  accounts   List local gcloud configurations/accounts
+  open       Start Cloud Shell and run ocs up
+  restart    Save, reboot Cloud Shell, wait, and run ocs up
+  status     Show remote ocs status
+  shell      Open an interactive Cloud Shell SSH session
+EOF
+      return 0 ;;
+  esac
+  command -v gcloud >/dev/null 2>&1 || die "gcloud is not installed on this machine."
   local G=(gcloud)
   [[ -n "$account" ]] && G+=(--configuration "$account")
   case "$action" in
@@ -1096,18 +1288,6 @@ cmd_local() {
       "${G[@]}" cloud-shell ssh --command='~/.local/bin/ocs status' ;;
     shell)
       exec "${G[@]}" cloud-shell ssh ;;
-    help|--help|-h)
-      cat <<'EOF'
-Usage: ocs local <command> [--account GCLOUD_CONFIG] [--stay]
-
-Commands:
-  accounts   List local gcloud configurations/accounts
-  open       Start Cloud Shell and run ocs up
-  restart    Save, reboot Cloud Shell, wait, and run ocs up
-  status     Show remote ocs status
-  shell      Open an interactive Cloud Shell SSH session
-EOF
-      ;;
     *) die "Unknown local command: $action" ;;
   esac
 }
@@ -1147,7 +1327,7 @@ ${C_BOLD}Multiple Google accounts${C_RESET}
 ${C_BOLD}Phone-only pairing${C_RESET}
   ocs connect
   Copy the printed openchamber:// URL into
-  OpenChamber -> Instances -> Add -> Paste link.
+  OpenChamber -> Settings -> Remote Instances -> Import link.
   Add --qr only if another device is available to scan it.
 
 Config: $OCS_CONFIG_FILE

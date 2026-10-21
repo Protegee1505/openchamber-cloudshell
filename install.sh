@@ -35,8 +35,14 @@ fi
 [[ -x "$DEST/bin/ocs" ]] || die "Checkout is missing bin/ocs."
 
 # On the first run, copy the source into the persistent state directory too, so
-# the CLI keeps working if this checkout is removed.
-"$DEST/bin/ocs" install --deps
+# the CLI keeps working if this checkout is removed. A laptop that only runs
+# `ocs local ...` can skip the OpenChamber dependencies:
+#   OCS_INSTALL_DEPS=0 bash -c "$(curl .../install.sh)"
+if [[ "${OCS_INSTALL_DEPS:-1}" == "0" ]]; then
+  "$DEST/bin/ocs" install --no-deps
+else
+  "$DEST/bin/ocs" install --deps
+fi
 
 case ":$PATH:" in
   *":$HOME/.local/bin:"*) ;;
