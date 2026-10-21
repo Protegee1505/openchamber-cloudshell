@@ -114,9 +114,9 @@ ocs restore
 ```
 
 The passphrase is not stored in the snapshot: enter the same one you saved when
-prompted, or set it with `OCS_PASSPHRASE=... ocs restore`. Then `ocs connect` to
-pair the phone. After that, `ocs local open` is enough; the passphrase is cached
-in that account's home.
+prompted (`ocs passphrase set` caches it for later restores). Then `ocs connect`
+to pair the phone. After that, `ocs local open` is enough; the passphrase is
+cached in that account's home.
 
 ## Safety and limits
 
