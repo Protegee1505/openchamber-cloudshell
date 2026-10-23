@@ -21,9 +21,13 @@ mkdir -p "$(dirname "$DEST")" "$HOME/.local/bin"
 if [[ -d "$DEST/.git" ]]; then
   say "Updating ocs source in $DEST..."
   git -C "$DEST" pull --ff-only >/dev/null 2>&1 || warn "Could not update source; using the existing checkout."
-elif [[ -e "$DEST" ]]; then
-  die "$DEST exists but is not a git checkout; move it away and retry."
 else
+  # `ocs install` keeps a plain copy here, so a second run of this bootstrap
+  # used to fail with "exists but is not a git checkout". Replace it.
+  if [[ -e "$DEST" ]]; then
+    say "Replacing non-git source in $DEST..."
+    rm -rf "$DEST"
+  fi
   say "Cloning $REPO..."
   if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
     gh repo clone "$REPO" "$DEST" -- --depth 1 >/dev/null
