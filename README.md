@@ -168,3 +168,12 @@ openchamber status --json
 - **Restore did not bring a project back**: only clean git repos with an
   `origin` remote are cloned. Copy uncommitted work manually.
 - **GitHub auth missing on a fresh account**: `gh auth login`, then retry.
+- **Terminal opens with no prompt**: a boot-time toolchain restore used to block
+  login. From `1.0.1` the restore runs in the background and `ocs doctor` checks
+  that a login shell starts in under 10 seconds. If a third-party hook (for
+  example `~/.config/notebox/bash-env.sh`) still calls
+  `cloudshell-bootstrap.sh --wait` synchronously, rerun `ocs install` to rewrite
+  `~/.config/ocs/shell.sh`.
+- **`ocs autostart` says OpenChamber is missing**: from `1.0.1` it installs once
+  per VM boot in the background. Watch progress with
+  `tail -f ~/.config/ocs/autostart.log`. Set `OCS_AUTO_INSTALL=0` to disable.

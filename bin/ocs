@@ -9,7 +9,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-OCS_VERSION="1.0.0"
+OCS_VERSION="1.0.1"
 OCS_CODE_REPO="${OCS_CODE_REPO:-Protegee1505/openchamber-cloudshell}"
 OCS_DEFAULT_SYNC_REPO="Protegee1505/openchamber-sync"
 OCS_RELEASE_TAG="snapshots"
@@ -38,6 +38,30 @@ need_cmd() {
 
 is_cloudshell() {
   [[ -n "${GOOGLE_CLOUD_SHELL:-}" ]] || [[ "$(hostname 2>/dev/null || true)" == cs-* ]]
+}
+
+# Commands also run from cron, boot hooks and `gcloud cloud-shell ssh`, where
+# PATH has neither ~/.local/bin nor Cloud Shell's Node. Fix that once here so
+# every subcommand sees the same tools the interactive shell does.
+ensure_runtime_path() {
+  local p root
+  for p in "$HOME/.local/bin" "$HOME/.yarn/bin" "$HOME/.opencode/bin"; do
+    case ":$PATH:" in
+      *":$p:"*) ;;
+      *) PATH="$p:$PATH" ;;
+    esac
+  done
+  for root in /usr/local/nvm/versions/node "$HOME/.nvm/versions/node"; do
+    [ -d "$root" ] || continue
+    for p in "$root"/*/bin; do
+      [ -d "$p" ] || continue
+      case ":$PATH:" in
+        *":$p:"*) ;;
+        *) PATH="$p:$PATH" ;;
+      esac
+    done
+  done
+  export PATH
 }
 
 SCRIPT_SOURCE="${BASH_SOURCE[0]}"
@@ -722,6 +746,23 @@ cmd_up() {
 cmd_autostart() {
   load_config
   health_ok && return 0
+  if ! command -v openchamber >/dev/null 2>&1; then
+    # A fresh Cloud Shell only has ocs. Install once per VM boot in the
+    # background so the terminal never waits on a 280 MB download.
+    if [[ "${OCS_AUTO_INSTALL:-1}" == "1" ]]; then
+      local boot_id stamp
+      boot_id="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo persistent)"
+      stamp="$OCS_CONFIG_DIR/.auto-install-$boot_id"
+      if mkdir "$stamp" 2>/dev/null; then
+        printf '%s\n' "ocs: OpenChamber is missing; installing in the background" >>"$OCS_CONFIG_DIR/autostart.log" 2>&1
+        ( "$HOME/.local/bin/ocs" install --deps >>"$OCS_CONFIG_DIR/autostart.log" 2>&1 \
+          && "$HOME/.local/bin/ocs" autostart >>"$OCS_CONFIG_DIR/autostart.log" 2>&1 & ) || true
+      fi
+    else
+      printf '%s\n' "ocs: OpenChamber is not installed. Run: ocs install --deps" >>"$OCS_CONFIG_DIR/autostart.log" 2>&1
+    fi
+    return 0
+  fi
   lock_acquire 0 || return 0
   OCS_LOCK_HELD=1
   export OCS_AUTO=1
@@ -927,6 +968,7 @@ cmd_doctor() {
   check "node >= 24.14" bash -c 'v=$(node -v 2>/dev/null); [[ "$v" =~ ^v([0-9]+)\.([0-9]+) ]] && { [ "${BASH_REMATCH[1]}" -gt 24 ] || { [ "${BASH_REMATCH[1]}" -eq 24 ] && [ "${BASH_REMATCH[2]}" -ge 14 ]; }; }'
   check "opencode" command -v opencode
   check "openchamber" command -v openchamber
+  check "shell starts in under 10s" bash -c 'timeout 10 bash -lic true >/dev/null 2>&1'
   check "GitHub auth" gh auth status
   check "snapshot repo access" gh repo view "$OCS_REPO"
   check "passphrase cached" test -s "$OCS_PASSFILE"
@@ -942,6 +984,10 @@ cmd_doctor() {
   local free_kb
   free_kb="$(df -Pk "$HOME" | awk 'NR==2 {print $4}')"
   if [[ "${free_kb:-0}" -gt 512000 ]]; then ok "disk space ($((free_kb / 1024)) MiB free)"; else warn "Low disk space: $((free_kb / 1024)) MiB"; failures=$((failures + 1)); fi
+  if [[ -x "$HOME/notebox/scripts/cloudshell-bootstrap.sh" ]] \
+     && [[ ! -f "${NOTEBOX_BUILD_HOME:-/tmp/opencode}/.notebox-ready" ]]; then
+    warn "Toolchain is restoring in the background (cargo/rustc unavailable until it finishes)"
+  fi
   if health_ok; then ok "OpenChamber health"; else warn "OpenChamber is not running (ocs up)"; fi
   if [[ "$failures" -gt 0 ]]; then
     warn "$failures check(s) need attention."
@@ -984,18 +1030,35 @@ for _ocs_p in "$HOME/.local/bin" "$HOME/.yarn/bin" "$HOME/.opencode/bin"; do
     *) PATH="$_ocs_p:$PATH" ;;
   esac
 done
-# nvm installs Node below ~/.nvm; add any installed node bin directory.
-if [ -d "$HOME/.nvm/versions/node" ]; then
-  for _ocs_p in "$HOME"/.nvm/versions/node/*/bin; do
+# Node ships with Cloud Shell under /usr/local/nvm; nvm installs under ~/.nvm.
+for _ocs_root in /usr/local/nvm/versions/node "$HOME/.nvm/versions/node"; do
+  [ -d "$_ocs_root" ] || continue
+  for _ocs_p in "$_ocs_root"/*/bin; do
     [ -d "$_ocs_p" ] || continue
     case ":$PATH:" in
       *":$_ocs_p:"*) ;;
       *) PATH="$_ocs_p:$PATH" ;;
     esac
   done
-fi
+done
 export PATH
-unset _ocs_p
+unset _ocs_p _ocs_root
+
+# Restore an ephemeral toolchain, but never block the prompt. A cold rebuild
+# can take tens of minutes, and a shell that waits for it looks frozen.
+if [ -x "$HOME/notebox/scripts/cloudshell-bootstrap.sh" ]; then
+  _ocs_store="${NOTEBOX_BUILD_HOME:-/tmp/opencode}"
+  _ocs_running=0
+  if command -v pgrep >/dev/null 2>&1 && pgrep -f 'cloudshell-bootstrap.sh' >/dev/null 2>&1; then
+    _ocs_running=1
+  fi
+  if [ ! -f "$_ocs_store/.notebox-ready" ] && [ "$_ocs_running" -eq 0 ]; then
+    ( nohup env -u BASH_ENV "$HOME/notebox/scripts/cloudshell-bootstrap.sh" --wait --quiet >/dev/null 2>&1 & ) || true
+    printf '%s\n' "ocs: toolchain restoring in background; the shell is ready" >&2
+  fi
+  unset _ocs_store _ocs_running
+fi
+
 if [ -x "$HOME/.local/bin/ocs" ] && [ -z "${OCS_SHELL_STARTED:-}" ]; then
   export OCS_SHELL_STARTED=1
   ( "$HOME/.local/bin/ocs" autostart >/dev/null 2>&1 & ) || true
@@ -1078,14 +1141,33 @@ install_deps() {
     fi
   fi
 
-  local major=0 minor=0
-  if command -v node >/dev/null 2>&1; then
-    local nv
-    nv="$(node -v | sed 's/^v//')"
-    major="${nv%%.*}"
-    minor="$(printf '%s' "$nv" | cut -d. -f2)"
+  node_ok() {
+    local v maj min
+    v="$(node -v 2>/dev/null | sed 's/^v//')" || return 1
+    [ -n "$v" ] || return 1
+    maj="${v%%.*}"
+    min="$(printf '%s' "$v" | cut -d. -f2)"
+    [[ "${maj:-0}" -gt 24 || ( "${maj:-0}" -eq 24 && "${min:-0}" -ge 14 ) ]]
+  }
+  if ! node_ok; then
+    # Cloud Shell already ships a modern Node under /usr/local/nvm. Use it
+    # instead of downloading a second toolchain into the home disk.
+    local cand cdir cv cmaj cmin
+    for cand in /usr/local/nvm/versions/node/*/bin/node "$HOME"/.nvm/versions/node/*/bin/node; do
+      [[ -x "$cand" ]] || continue
+      cv="$("$cand" -v 2>/dev/null | sed 's/^v//')"
+      cmaj="${cv%%.*}"
+      cmin="$(printf '%s' "$cv" | cut -d. -f2)"
+      if [[ "${cmaj:-0}" -gt 24 || ( "${cmaj:-0}" -eq 24 && "${cmin:-0}" -ge 14 ) ]]; then
+        cdir="$(dirname "$cand")"
+        export PATH="$cdir:$PATH"
+        info "Using Node $cv from $cdir"
+        break
+      fi
+    done
   fi
-  if [[ "${major:-0}" -lt 24 || ( "${major:-0}" -eq 24 && "${minor:-0}" -lt 14 ) ]]; then
+
+  if ! node_ok; then
     info "Installing Node 24 with nvm..."
     export NVM_DIR="$HOME/.nvm"
     if [[ ! -s "$NVM_DIR/nvm.sh" ]]; then
@@ -1115,6 +1197,8 @@ install_deps() {
     fi
   fi
   hash -r
+  command -v openchamber >/dev/null 2>&1 \
+    || die "OpenChamber install failed. Read the npm output above, then rerun: ocs install --deps"
 }
 
 cmd_install() {
@@ -1354,6 +1438,7 @@ EOF
 }
 
 main() {
+  ensure_runtime_path
   local command="${1:-help}"
   shift || true
   case "$command" in
