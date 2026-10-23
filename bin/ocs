@@ -649,7 +649,12 @@ start_openchamber() {
   info "Starting OpenChamber on port $OCS_PORT ..."
   # Close the ocs lock fd for the daemon; otherwise a forked OpenChamber would
   # inherit the flock and keep the lock forever.
-  openchamber --port "$OCS_PORT" >>"$OCS_CONFIG_DIR/openchamber.out" 2>&1 9>&- || true
+  # OpenChamber probes its environment with `bash -lic`, which sources the
+  # notebox build guard. During a Cloud Shell rebuild that guard can block
+  # for minutes waiting for the toolchain lock. Make that wait non-blocking
+  # for OpenChamber and its children; an explicit user setting still wins.
+  NOTEBOX_BOOTSTRAP_WAIT="${NOTEBOX_BOOTSTRAP_WAIT:-0}" \
+    openchamber --port "$OCS_PORT" >>"$OCS_CONFIG_DIR/openchamber.out" 2>&1 9>&- || true
   local i
   for i in $(seq 1 60); do
     if health_ok; then
